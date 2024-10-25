@@ -1,0 +1,107 @@
+[
+    {
+        "id": "1f27ad7ab9c4bd93",
+        "type": "tab",
+        "label": "Flow 1",
+        "disabled": false,
+        "info": "",
+        "env": []
+    },
+    {
+        "id": "383c94f421ff073a",
+        "type": "tcp in",
+        "z": "1f27ad7ab9c4bd93",
+        "name": "",
+        "server": "server",
+        "host": "",
+        "port": "5000",
+        "datamode": "stream",
+        "datatype": "buffer",
+        "newline": "",
+        "topic": "",
+        "trim": false,
+        "base64": false,
+        "tls": "",
+        "x": 240,
+        "y": 320,
+        "wires": [
+            [
+                "cb07757cad0d2cd8"
+            ]
+        ]
+    },
+    {
+        "id": "cb07757cad0d2cd8",
+        "type": "function",
+        "z": "1f27ad7ab9c4bd93",
+        "name": "Json Parsing",
+        "func": "let buf = msg.payload;\nnode.log(\"Received Msg in Hex \" + buf.toString('hex'));\n\nconst filePath = 'device.json';\n\nlet parsedData = {};\n\n// Function to convert BCD Time to UTC\nfunction convertBCDTimeToUTC(bcdTime) {\n    let year = 2000 + parseInt(bcdTime.slice(0, 2), 10);\n    let month = parseInt(bcdTime.slice(2, 4), 10) - 1;\n    let day = parseInt(bcdTime.slice(4, 6), 10);\n    let hour = parseInt(bcdTime.slice(6, 8), 10);\n    let minute = parseInt(bcdTime.slice(8, 10), 10);\n    let second = parseInt(bcdTime.slice(10, 12), 10);\n    let chinaTime = new Date(Date.UTC(year, month, day, hour, minute, second));\n    //chinaTime.setUTCHours(chinaTime.getUTCHours() - 8);\n    return chinaTime.toISOString();\n}\n\n// Parse the data into the parsedData object\nparsedData.frameHeader = buf[0];\nparsedData.frameLength = (buf[1] << 8) | buf[2];\nparsedData.instrumentNumber = Buffer.from(buf.slice(3, 15)).toString('ascii').replace(/\\u0000/g, '').trim();\nparsedData.functionCode = buf[15];\n\nif (parsedData.functionCode === 0x01) {\n    parsedData.packageNumber = (buf[16] << 8) | buf[17];\n    parsedData.followUpMessage = buf[18];\n    parsedData.signalStrength = buf[19];\n    parsedData.batteryStatus = buf[20];\n    parsedData.batteryVoltage = ((buf[21] << 8) | buf[22]) / 100;\n    parsedData.transmissionInterval = (buf[23] << 8) | buf[24];\n    parsedData.highTempAlarm = ((buf[25] << 8) | buf[26]) / 100;\n    parsedData.lowTempAlarm = ((buf[27] << 8) | buf[28]) / 100;\n    parsedData.highPressureAlarm = ((buf[29] << 8) | buf[30]) / 100;\n    parsedData.lowPressureAlarm = ((buf[31] << 8) | buf[32]) / 100;\n\n    let alarmEnable = buf[33];\n    parsedData.alarmEnable = {\n        highTempAlarmEnabled: (alarmEnable & 0x01) ? true : false,\n        lowTempAlarmEnabled: (alarmEnable & 0x02) ? true : false,\n        highPressureAlarmEnabled: (alarmEnable & 0x04) ? true : false,\n        lowPressureAlarmEnabled: (alarmEnable & 0x08) ? true : false\n    };\n\n    parsedData.numberOfRecords = (buf[34] << 8) | buf[35];\n    parsedData.records = [];\n    let offset = 36;\n\n    for (let i = 0; i < parsedData.numberOfRecords; i++) {\n        let record = {};\n        let bcdTime = buf.slice(offset, offset + 6).toString('hex');\n        record.time = convertBCDTimeToUTC(bcdTime);\n        offset += 6;\n        record.instrumentType = buf[offset];\n        offset += 1;\n\n        let operationStatus = (buf[offset] << 8) | buf[offset + 1];\n        record.operationStatus = {\n            temperatureSensorConnected: (operationStatus & 0x01) === 0, \n            lowTempAlarm: (operationStatus & 0x02) ? true : false,\n            highTempAlarm: (operationStatus & 0x04) ? true : false,\n            pressureSensorConnected: (operationStatus & 0x08) === 0,\n            lowPressureAlarm: (operationStatus & 0x10) ? true : false,\n            highPressureAlarm: (operationStatus & 0x20) ? true : false,\n            onlineStatus: (operationStatus & 0x40) ? true : false         \n        };\n\n        offset += 2; \n\n        record.temperature = ((buf[offset] << 8) | buf[offset + 1]) / 100;\n        offset += 2;\n\n        record.pressure = ((buf[offset] << 8) | buf[offset + 1]) / 100;\n        offset += 2;\n\n        parsedData.records.push(record);\n    }\n}\nnode.log(JSON.stringify(parsedData,null,2));;\n\n// Send transformed messages to Azure IoT Hub without returning msg\nparsedData.records.forEach((record) => {\n    let instrumentNumber = parsedData.instrumentNumber;\n    let azureMessage = {\n        \"TimeStamp\": record.time,\n        \"ID\": 1076,\n        [\"Temperature_\" + instrumentNumber]: {\n            \"Val\": record.temperature\n        },\n        [\"Pressure_\" + instrumentNumber]: {\n            \"Val\": record.pressure\n        },\n        [\"Battery_Voltage_\" + instrumentNumber]: {\n            \"Val\": parsedData.batteryVoltage\n        }\n    };\n\n    // Logic to ensure only the latest entry of an instrument number is in the file\n    fs.readFile(filePath, 'utf8', (err, data) => {\n        if (err) {\n            node.error(err, msg);\n            return;\n        }\n\n        // Parse the file content, assuming it is a JSON array\n        let instrumentEntries = [];\n        if (data) {\n            instrumentEntries = JSON.parse(data.trim());\n        }\n\n        // Check if the current instrumentNumber exists in the file\n        let instrumentFound = false;\n        for (let i = 0; i < instrumentEntries.length; i++) {\n            if (instrumentEntries[i].instrument === instrumentNumber) {\n                // Update the timestamp for the existing instrument\n                instrumentEntries[i].lastDataReceived = record.time;\n                instrumentFound = true;\n                break;\n            }\n        }\n\n        // If the instrument number was not found, add a new entry\n        if (!instrumentFound) {\n            instrumentEntries.push({\n                \"instrument\": instrumentNumber,\n                \"lastDataReceived\": record.time\n            });\n        }\n\n        // Write the updated data back to the file\n        fs.writeFile(filePath, JSON.stringify(instrumentEntries, null, 2), (err) => {\n            if (err) {\n                node.error(\"Failed to write to file\", err);\n            }\n        });\n\n        // Logging for debugging purposes\n        node.log(`The last data received from the instrument number ${instrumentNumber} is ${record.time}`);\n    });\n\n    // Prepare the IoT message\n    let IoTmsg = {\n        payload: JSON.stringify(azureMessage)\n    };\n\n    // Send the message to Azure IoT Hub\n    node.send(IoTmsg);\n    node.log(JSON.stringify(IoTmsg, null, 2));\n});",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [
+            {
+                "var": "fs",
+                "module": "fs"
+            }
+        ],
+        "x": 430,
+        "y": 320,
+        "wires": [
+            [
+                "6d724878fb380d93"
+            ]
+        ]
+    },
+    {
+        "id": "6d724878fb380d93",
+        "type": "mqtt out",
+        "z": "1f27ad7ab9c4bd93",
+        "name": "Azure IoT Hub",
+        "topic": "devices/1076/messages/events/1076",
+        "qos": "1",
+        "retain": "",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "f47a98de9714566e",
+        "x": 620,
+        "y": 320,
+        "wires": []
+    },
+    {
+        "id": "f47a98de9714566e",
+        "type": "mqtt-broker",
+        "name": "Azure IoT Hub",
+        "broker": "ssl://sngpliotpt-987.azure-devices.net",
+        "port": "1883",
+        "clientid": "1076",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": "4",
+        "keepalive": "60",
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthRetain": "false",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closeRetain": "false",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willRetain": "false",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    }
+]
